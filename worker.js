@@ -79,22 +79,53 @@ const ADAPTERS = {
      'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    configured: true,
+    auth: 'oauth',
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
+      tokenUrl: 'https://identity.xero.com/connect/token',
+      scopes: 'offline_access accounting.reports.profitandloss.read',
+      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
+      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
+      tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth (client_secret_basic)
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+    async status(env, h) {
+      const tokens = await h.getTokens();
+      if (!tokens) return { connected: false };
+      try {
+        const conns = await h.fetchJson('https://api.xero.com/connections', { headers: { Accept: 'application/json' } });
+        if (!Array.isArray(conns) || !conns.length) return { connected: false };
+        const c = conns[0];
+        return {
+          connected: true,
+          org: c.tenantName || null,
+          sandbox: /demo company/i.test(c.tenantName || ''),
+          lastSync: null
+        };
+      } catch (e) {
+        return { connected: false };
+      }
+    },
+    async fetchRange(env, h, q) {
+      return xeroFetchRange(env, h, q.from, q.to);
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const revenue = [], cogs = [], wagesSuper = [], overheads = [];
+      for (const mo of months) {
+        const [y, m] = mo.split('-').map(Number);
+        const from = mo + '-01';
+        const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+        const to = mo + '-' + String(lastDay).padStart(2, '0');
+        try {
+          const r = await xeroFetchRange(env, h, from, to);
+          revenue.push(r.revenue); cogs.push(r.cogs); wagesSuper.push(r.wagesSuper); overheads.push(r.overheads);
+        } catch (e) {
+          revenue.push(null); cogs.push(null); wagesSuper.push(null); overheads.push(null);
+        }
+      }
+      return { months, revenue, cogs, wagesSuper, overheads };
+    }
   },
 
   /* >>> ADAPTER 2: POS
@@ -137,6 +168,87 @@ const ADAPTERS = {
     async fetchMonthly(env, h, q) { return { months: [], cost: [] }; }
   }
 };
+
+/* ----------------------------------------------------------------------------
+   Xero accounting helpers (kpi-spec.md is the law - read the owner's chart of
+   accounts as-is, never re-categorise). Revenue = Income/Revenue section
+   total (trading income only, "Other Income" excluded). Cost of goods = Cost
+   of Sales section total. Within Operating Expenses, lines matching the wage
+   keywords are wagesSuper; Overheads = Operating Expenses total minus
+   wagesSuper. The exact wage-account list is CONFIRMED WITH THE OWNER during
+   reconciliation (capability-matrix.md) - this keyword match only proposes it.
+---------------------------------------------------------------------------- */
+const XERO_WAGE_KEYWORDS = /wages|salaries|superannuation|super|payroll|annual leave|long service|workcover/i;
+
+async function xeroConnection(env, h) {
+  const conns = await h.fetchJson('https://api.xero.com/connections', { headers: { Accept: 'application/json' } });
+  if (!Array.isArray(conns) || !conns.length) {
+    const e = new Error('no Xero organisation connected'); e.status = 401; throw e;
+  }
+  return conns[0];
+}
+
+function xeroFindSection(rows, titleTest) {
+  for (const r of rows || []) {
+    if (r.RowType === 'Section' && titleTest(r.Title || '')) return r;
+    if (r.Rows) {
+      const found = xeroFindSection(r.Rows, titleTest);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+function xeroFlattenRows(rows) {
+  const out = [];
+  for (const r of rows || []) {
+    if (r.RowType === 'Row') out.push(r);
+    if (r.Rows) out.push(...xeroFlattenRows(r.Rows));
+  }
+  return out;
+}
+function xeroCellNum(cell) {
+  const n = parseFloat(cell && cell.Value);
+  return isFinite(n) ? n : 0;
+}
+function xeroLastCellNum(row) {
+  return row && row.Cells && row.Cells.length ? xeroCellNum(row.Cells[row.Cells.length - 1]) : 0;
+}
+function xeroSectionTotal(section) {
+  if (!section) return 0;
+  const summary = (section.Rows || []).find((r) => r.RowType === 'SummaryRow');
+  if (summary) return xeroLastCellNum(summary);
+  return xeroFlattenRows(section.Rows).reduce((sum, r) => sum + xeroLastCellNum(r), 0);
+}
+
+function xeroParsePnL(reportJson) {
+  const report = reportJson && reportJson.Reports && reportJson.Reports[0];
+  const rows = (report && report.Rows) || [];
+  const incomeSection = xeroFindSection(rows, (t) => /income|revenue|sales/i.test(t) && !/other income/i.test(t));
+  const cogsSection = xeroFindSection(rows, (t) => /cost of sales|cost of goods/i.test(t));
+  const opexSection = xeroFindSection(rows, (t) => /operating expenses|expenses/i.test(t) && !/cost of sales/i.test(t));
+
+  const revenue = xeroSectionTotal(incomeSection);
+  const cogs = xeroSectionTotal(cogsSection);
+  const opexTotal = xeroSectionTotal(opexSection);
+
+  let wagesSuper = 0;
+  if (opexSection) {
+    for (const r of xeroFlattenRows(opexSection.Rows)) {
+      const label = (r.Cells && r.Cells[0] && r.Cells[0].Value) || '';
+      if (XERO_WAGE_KEYWORDS.test(label)) wagesSuper += xeroLastCellNum(r);
+    }
+  }
+  return { revenue, cogs, wagesSuper, overheads: opexTotal - wagesSuper };
+}
+
+async function xeroFetchRange(env, h, from, to) {
+  const conn = await xeroConnection(env, h);
+  const p = new URLSearchParams({ fromDate: from, toDate: to });
+  const data = await h.fetchJson('https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?' + p.toString(), {
+    headers: { Accept: 'application/json', 'Xero-Tenant-Id': conn.tenantId }
+  });
+  return xeroParsePnL(data);
+}
 
 /* ============================================================================
    Everything below is the shell. You should rarely need to edit it.
