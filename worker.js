@@ -151,7 +151,11 @@ const ADAPTERS = {
         const data = await squareRequest(env, '/v2/locations');
         const locs = (data && data.locations) || [];
         if (!locs.length) return { connected: false };
-        return { connected: true, org: locs.map((l) => l.name).filter(Boolean).join(', ') || null, sandbox: false, lastSync: null };
+        /* Show only the venue this dashboard actually counts (see squareLocationIds) - not every
+           location on the Square account, which would wrongly suggest they're all being counted. */
+        const matched = locs.filter((l) => l.name === SQUARE_LOCATION_NAME);
+        const shown = matched.length ? matched : locs;
+        return { connected: true, org: shown.map((l) => l.name).filter(Boolean).join(', ') || null, sandbox: false, lastSync: null };
       } catch (e) {
         return { connected: false };
       }
@@ -295,9 +299,21 @@ async function squareRequest(env, path, body) {
   if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
   return res.json();
 }
+/* This Square account has multiple locations (Byford, Hilbert, Little Bao Co).
+   This dashboard is built for the Byford venue only (confirmed against the
+   connected Xero org "Coffix Byford") - the owner confirmed on 2026-07-19
+   that the location named exactly "COFFIX Byford" is the correct, currently
+   trading one (a second, differently-capitalised "Coffix Byford" entry is
+   not it). Locking to this name keeps other venues out of the count even if
+   Square's location list order changes. */
+const SQUARE_LOCATION_NAME = 'COFFIX Byford';
 async function squareLocationIds(env) {
   const data = await squareRequest(env, '/v2/locations');
-  return ((data && data.locations) || []).map((l) => l.id).filter(Boolean);
+  const all = (data && data.locations) || [];
+  const matched = all.filter((l) => l.name === SQUARE_LOCATION_NAME).map((l) => l.id).filter(Boolean);
+  if (matched.length) return matched;
+  /* Safety net: never silently count nothing - but this should not happen once confirmed above. */
+  return all.map((l) => l.id).filter(Boolean);
 }
 /* The UTC offset of an IANA timezone at a given instant (minutes, e.g. +660 for AEST). */
 function tzOffsetMinutes(tz, atUtcDate) {
