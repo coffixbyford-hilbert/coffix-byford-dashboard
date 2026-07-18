@@ -142,12 +142,39 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    async status(env, h) {
+      if (!env.POS_API_TOKEN) return { connected: false };
+      try {
+        const data = await squareRequest(env, '/v2/locations');
+        const locs = (data && data.locations) || [];
+        if (!locs.length) return { connected: false };
+        return { connected: true, org: locs.map((l) => l.name).filter(Boolean).join(', ') || null, sandbox: false, lastSync: null };
+      } catch (e) {
+        return { connected: false };
+      }
+    },
+    async fetchRange(env, h, q) {
+      return { count: await squareCountRange(env, q.from, q.to, q.tz, q.rollover) };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const count = [];
+      for (const mo of months) {
+        const [y, m] = mo.split('-').map(Number);
+        const from = mo + '-01';
+        const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+        const to = mo + '-' + String(lastDay).padStart(2, '0');
+        try {
+          count.push(await squareCountRange(env, from, to, q.tz, q.rollover));
+        } catch (e) {
+          count.push(null);
+        }
+      }
+      return { months, count };
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -248,6 +275,73 @@ async function xeroFetchRange(env, h, from, to) {
     headers: { Accept: 'application/json', 'Xero-Tenant-Id': conn.tenantId }
   });
   return xeroParsePnL(data);
+}
+
+/* ----------------------------------------------------------------------------
+   Square POS helpers. ONE number only: completed transaction count (voids/
+   cancellations excluded, refunds never reduce the count - refunds are their
+   own records, untouched here). Production host only - a token pasted from
+   the Sandbox side of the Developer Console will fail every call here, which
+   is the deliberate signal to go back and copy the Production token instead.
+---------------------------------------------------------------------------- */
+async function squareRequest(env, path, body) {
+  const token = env.POS_API_TOKEN;
+  if (!token) { const e = new Error('Square not connected'); e.status = 401; throw e; }
+  const res = await fetch('https://connect.squareup.com' + path, {
+    method: body ? 'POST' : 'GET',
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+  return res.json();
+}
+async function squareLocationIds(env) {
+  const data = await squareRequest(env, '/v2/locations');
+  return ((data && data.locations) || []).map((l) => l.id).filter(Boolean);
+}
+/* The UTC offset of an IANA timezone at a given instant (minutes, e.g. +660 for AEST). */
+function tzOffsetMinutes(tz, atUtcDate) {
+  const parts = {};
+  new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  }).formatToParts(atUtcDate).forEach((p) => { if (p.type !== 'literal') parts[p.type] = p.value; });
+  const asUtc = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second);
+  return (asUtc - atUtcDate.getTime()) / 60000;
+}
+/* UTC instant for local midnight of dateStr in tz, shifted by the trading-day
+   rollover (hours past midnight that still belong to the previous day). */
+function zonedDayStartUtc(dateStr, tz, rolloverHours) {
+  const guess = new Date(dateStr + 'T00:00:00Z');
+  const offset1 = tzOffsetMinutes(tz, guess);
+  let instant = new Date(guess.getTime() - offset1 * 60000);
+  const offset2 = tzOffsetMinutes(tz, instant);
+  if (offset2 !== offset1) instant = new Date(guess.getTime() - offset2 * 60000);
+  return new Date(instant.getTime() + (rolloverHours || 0) * 3600000);
+}
+async function squareCountRange(env, from, to, tz, rollover) {
+  const locationIds = await squareLocationIds(env);
+  if (!locationIds.length) return 0;
+  const zone = tz || 'Australia/Sydney';
+  const startAt = zonedDayStartUtc(from, zone, rollover || 0);
+  const toNextDay = new Date(new Date(to + 'T00:00:00Z').getTime() + 86400000).toISOString().slice(0, 10);
+  const endAt = zonedDayStartUtc(toNextDay, zone, rollover || 0);
+  let cursor = null, count = 0;
+  do {
+    const body = {
+      location_ids: locationIds.slice(0, 10),
+      query: { filter: {
+        state_filter: { states: ['COMPLETED'] },
+        date_time_filter: { closed_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
+      } },
+      limit: 500
+    };
+    if (cursor) body.cursor = cursor;
+    const data = await squareRequest(env, '/v2/orders/search', body);
+    count += ((data && data.orders) || []).length;
+    cursor = data && data.cursor;
+  } while (cursor);
+  return count;
 }
 
 /* ============================================================================
