@@ -357,8 +357,15 @@ async function squareCountRange(env, from, to, tz, rollover) {
       location_ids: locationIds.slice(0, 10),
       query: {
         filter: {
-          state_filter: { states: ['COMPLETED'] },
-          date_time_filter: { closed_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
+          /* COMPLETED alone misses real sales sitting in orders that never
+             formally transitioned to Completed (common with card-on-file,
+             delivery-platform and some POS-flow payments) - see worker.js
+             build notes. OPEN is included so those aren't missed; a genuinely
+             abandoned/never-paid OPEN order has no bearing here since we are
+             counting orders, not dollars - Xero (not this count) is the only
+             source of any money figure. */
+          state_filter: { states: ['COMPLETED', 'OPEN'] },
+          date_time_filter: { created_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
         }
       },
       limit: 500
@@ -993,54 +1000,6 @@ export default {
     if (authRoute && request.method === 'GET') {
       if (!loggedIn) return Response.redirect(url.origin + '/', 302);
       return authRoute[2] === 'start' ? authStart(env, authRoute[1], url) : authCallback(env, authRoute[1], url);
-    }
-    if (path === '/api/_debug_pos' && request.method === 'GET') {
-      /* TEMP diagnostic - remove once the Square count reconciles. Logged-in only.
-         Calls the REAL squareCountRange used by the dashboard, with timing. */
-      if (!loggedIn) return json({ error: 'auth' }, 401);
-      const from = url.searchParams.get('from') || '2026-06-01';
-      const to = url.searchParams.get('to') || '2026-06-30';
-      const tz = url.searchParams.get('tz') || 'Australia/Sydney';
-      const rollover = parseInt(url.searchParams.get('rollover') || '0', 10);
-      const out = { from, to, tz, rollover };
-      const started = Date.now();
-      out.pages = [];
-      try {
-        const locationIds = await squareLocationIds(env);
-        out.locationIds = locationIds;
-        const zone = tz;
-        const startAt = zonedDayStartUtc(from, zone, rollover || 0);
-        const toNextDay = new Date(new Date(to + 'T00:00:00Z').getTime() + 86400000).toISOString().slice(0, 10);
-        const endAt = zonedDayStartUtc(toNextDay, zone, rollover || 0);
-        out.startAt = startAt.toISOString();
-        out.endAt = endAt.toISOString();
-        let cursor = null, count = 0, pageNum = 0;
-        do {
-          pageNum++;
-          const body = {
-            location_ids: locationIds.slice(0, 10),
-            query: { filter: {
-              state_filter: { states: ['COMPLETED', 'OPEN'] },
-              date_time_filter: { created_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
-            } },
-            limit: 500
-          };
-          if (cursor) body.cursor = cursor;
-          const data = await squareRequest(env, '/v2/orders/search', body);
-          const n = ((data && data.orders) || []).length;
-          count += n;
-          cursor = data && data.cursor;
-          out.pages.push({ page: pageNum, orders: n, hasCursor: !!cursor, errors: data && data.errors });
-          if (pageNum > 30) { out.pages.push({ note: 'stopped after 30 pages as a safety cap' }); break; }
-        } while (cursor);
-        out.count = count;
-        out.ms = Date.now() - started;
-      } catch (e) {
-        out.ms = Date.now() - started;
-        out.callError = String((e && e.message) || e);
-        out.callErrorStatus = e && e.status;
-      }
-      return json(out);
     }
     if (path === '/api/disconnect' && request.method === 'POST') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
