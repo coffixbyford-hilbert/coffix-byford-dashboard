@@ -1009,8 +1009,38 @@ export default {
       const rollover = parseInt(url.searchParams.get('rollover') || '0', 10);
       try {
         const info = await squareLocationInfo(env);
-        const count = await squareCountRange(env, from, to, null, rollover);
-        return json({ from, to, locationInfo: info, count });
+        const zone = info.timezone || 'Australia/Sydney';
+        const startAt = zonedDayStartUtc(from, zone, rollover || 0);
+        const toNextDay = new Date(new Date(to + 'T00:00:00Z').getTime() + 86400000).toISOString().slice(0, 10);
+        const endAt = zonedDayStartUtc(toNextDay, zone, rollover || 0);
+        let cursor = null;
+        const buckets = { COMPLETED: 0, OPEN_nonzero: 0, OPEN_zero: 0, OPEN_giftcard: 0, other: 0 };
+        const sampleOpenZero = [];
+        do {
+          const body = {
+            location_ids: info.ids.slice(0, 10),
+            query: { filter: {
+              state_filter: { states: ['COMPLETED', 'OPEN'] },
+              date_time_filter: { created_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
+            } },
+            limit: 500
+          };
+          if (cursor) body.cursor = cursor;
+          const data = await squareRequest(env, '/v2/orders/search', body);
+          for (const o of (data && data.orders) || []) {
+            const total = (o.total_money && o.total_money.amount) || 0;
+            const isGiftCard = (o.line_items || []).some((li) => /gift ?card/i.test(li.name || ''));
+            if (isGiftCard) buckets.OPEN_giftcard++;
+            if (o.state === 'COMPLETED') buckets.COMPLETED++;
+            else if (o.state === 'OPEN' && total > 0) { buckets.OPEN_nonzero++; }
+            else if (o.state === 'OPEN' && total === 0) {
+              buckets.OPEN_zero++;
+              if (sampleOpenZero.length < 5) sampleOpenZero.push({ id: o.id, created_at: o.created_at, updated_at: o.updated_at, source: o.source, state: o.state });
+            } else buckets.other++;
+          }
+          cursor = data && data.cursor;
+        } while (cursor);
+        return json({ from, to, locationInfo: info, buckets, sampleOpenZero });
       } catch (e) {
         return json({ error: String((e && e.message) || e) });
       }
