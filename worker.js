@@ -335,13 +335,15 @@ function zonedDayStartUtc(dateStr, tz, rolloverHours) {
   if (offset2 !== offset1) instant = new Date(guess.getTime() - offset2 * 60000);
   return new Date(instant.getTime() + (rolloverHours || 0) * 3600000);
 }
-/* Counts PAYMENTS, not orders - this is what Square's own Sales/Transactions
-   reports in the owner's dashboard are built on (an order can technically
-   exist without a completed payment; the owner's own report counts completed
-   payments). Only status COMPLETED counts; CANCELED/FAILED payments are
-   excluded. A later refund does not remove a payment from this count - the
-   original transaction still happened (kpi-spec.md: "refunds never reduce
-   the count"). */
+/* Counts completed orders via Orders Search (up to 500/page, so a busy month
+   stays well within Cloudflare's per-request subrequest budget - the earlier
+   Payments-based approach needed ~50+ pages for this venue's volume and hit
+   that ceiling). sort.sort_field MUST match the field the date filter uses
+   (CLOSED_AT) - filtering on closed_at while sorting/paginating on a
+   different field is a documented Square API gotcha that silently returns an
+   incomplete result set, which is what caused the earlier undercount.
+   Voided/cancelled orders excluded via state_filter; refunds are separate
+   records and never reduce this count (kpi-spec.md). */
 async function squareCountRange(env, from, to, tz, rollover) {
   const locationIds = await squareLocationIds(env);
   if (!locationIds.length) return 0;
@@ -349,24 +351,24 @@ async function squareCountRange(env, from, to, tz, rollover) {
   const startAt = zonedDayStartUtc(from, zone, rollover || 0);
   const toNextDay = new Date(new Date(to + 'T00:00:00Z').getTime() + 86400000).toISOString().slice(0, 10);
   const endAt = zonedDayStartUtc(toNextDay, zone, rollover || 0);
-  let count = 0;
-  for (const locationId of locationIds) {
-    let cursor = null;
-    do {
-      const p = new URLSearchParams({
-        location_id: locationId,
-        begin_time: startAt.toISOString(),
-        end_time: endAt.toISOString(),
-        sort_field: 'CREATED_AT',
-        limit: '100'
-      });
-      if (cursor) p.set('cursor', cursor);
-      const data = await squareRequest(env, '/v2/payments?' + p.toString());
-      const payments = (data && data.payments) || [];
-      count += payments.filter((pmt) => pmt.status === 'COMPLETED').length;
-      cursor = data && data.cursor;
-    } while (cursor);
-  }
+  let cursor = null, count = 0;
+  do {
+    const body = {
+      location_ids: locationIds.slice(0, 10),
+      query: {
+        filter: {
+          state_filter: { states: ['COMPLETED'] },
+          date_time_filter: { closed_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
+        },
+        sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' }
+      },
+      limit: 500
+    };
+    if (cursor) body.cursor = cursor;
+    const data = await squareRequest(env, '/v2/orders/search', body);
+    count += ((data && data.orders) || []).length;
+    cursor = data && data.cursor;
+  } while (cursor);
   return count;
 }
 
