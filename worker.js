@@ -369,10 +369,7 @@ async function squareCountRange(env, from, to, tz, rollover) {
           /* COMPLETED alone misses real sales sitting in orders that never
              formally transitioned to Completed (common with card-on-file,
              delivery-platform and some POS-flow payments) - see worker.js
-             build notes. OPEN is included so those aren't missed; a genuinely
-             abandoned/never-paid OPEN order has no bearing here since we are
-             counting orders, not dollars - Xero (not this count) is the only
-             source of any money figure. */
+             build notes. OPEN is included so those aren't missed. */
           state_filter: { states: ['COMPLETED', 'OPEN'] },
           date_time_filter: { created_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
         }
@@ -381,7 +378,14 @@ async function squareCountRange(env, from, to, tz, rollover) {
     };
     if (cursor) body.cursor = cursor;
     const data = await squareRequest(env, '/v2/orders/search', body);
-    count += ((data && data.orders) || []).length;
+    /* An OPEN order with a $0 total is an abandoned online checkout (cart
+       created, never paid) - not a completed sale, so it is excluded here.
+       COMPLETED orders are always real (Square would not mark a $0 cart
+       Completed). */
+    for (const o of (data && data.orders) || []) {
+      const total = (o.total_money && o.total_money.amount) || 0;
+      if (o.state === 'COMPLETED' || total > 0) count++;
+    }
     cursor = data && data.cursor;
   } while (cursor);
   return count;
@@ -1000,50 +1004,6 @@ export default {
     if (path === '/' || path === '/index.html') {
       if (loggedIn) return htmlResponse(dashboardHtml);
       return htmlResponse((await passcodeSet(env)) ? loginPage() : setupPage());
-    }
-    if (path === '/api/_debug_pos' && request.method === 'GET') {
-      /* TEMP diagnostic - remove once the Square count reconciles. Logged-in only. */
-      if (!loggedIn) return json({ error: 'auth' }, 401);
-      const from = url.searchParams.get('from') || '2026-06-01';
-      const to = url.searchParams.get('to') || '2026-06-30';
-      const rollover = parseInt(url.searchParams.get('rollover') || '0', 10);
-      try {
-        const info = await squareLocationInfo(env);
-        const zone = info.timezone || 'Australia/Sydney';
-        const startAt = zonedDayStartUtc(from, zone, rollover || 0);
-        const toNextDay = new Date(new Date(to + 'T00:00:00Z').getTime() + 86400000).toISOString().slice(0, 10);
-        const endAt = zonedDayStartUtc(toNextDay, zone, rollover || 0);
-        let cursor = null;
-        const buckets = { COMPLETED: 0, OPEN_nonzero: 0, OPEN_zero: 0, OPEN_giftcard: 0, other: 0 };
-        const sampleOpenZero = [];
-        do {
-          const body = {
-            location_ids: info.ids.slice(0, 10),
-            query: { filter: {
-              state_filter: { states: ['COMPLETED', 'OPEN'] },
-              date_time_filter: { created_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
-            } },
-            limit: 500
-          };
-          if (cursor) body.cursor = cursor;
-          const data = await squareRequest(env, '/v2/orders/search', body);
-          for (const o of (data && data.orders) || []) {
-            const total = (o.total_money && o.total_money.amount) || 0;
-            const isGiftCard = (o.line_items || []).some((li) => /gift ?card/i.test(li.name || ''));
-            if (isGiftCard) buckets.OPEN_giftcard++;
-            if (o.state === 'COMPLETED') buckets.COMPLETED++;
-            else if (o.state === 'OPEN' && total > 0) { buckets.OPEN_nonzero++; }
-            else if (o.state === 'OPEN' && total === 0) {
-              buckets.OPEN_zero++;
-              if (sampleOpenZero.length < 5) sampleOpenZero.push({ id: o.id, created_at: o.created_at, updated_at: o.updated_at, source: o.source, state: o.state });
-            } else buckets.other++;
-          }
-          cursor = data && data.cursor;
-        } while (cursor);
-        return json({ from, to, locationInfo: info, buckets, sampleOpenZero });
-      } catch (e) {
-        return json({ error: String((e && e.message) || e) });
-      }
     }
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
