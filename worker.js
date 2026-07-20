@@ -1004,14 +1004,41 @@ export default {
       const rollover = parseInt(url.searchParams.get('rollover') || '0', 10);
       const out = { from, to, tz, rollover };
       const started = Date.now();
+      out.pages = [];
       try {
-        out.count = await squareCountRange(env, from, to, tz, rollover);
+        const locationIds = await squareLocationIds(env);
+        out.locationIds = locationIds;
+        const zone = tz;
+        const startAt = zonedDayStartUtc(from, zone, rollover || 0);
+        const toNextDay = new Date(new Date(to + 'T00:00:00Z').getTime() + 86400000).toISOString().slice(0, 10);
+        const endAt = zonedDayStartUtc(toNextDay, zone, rollover || 0);
+        out.startAt = startAt.toISOString();
+        out.endAt = endAt.toISOString();
+        let cursor = null, count = 0, pageNum = 0;
+        do {
+          pageNum++;
+          const body = {
+            location_ids: locationIds.slice(0, 10),
+            query: { filter: {
+              state_filter: { states: ['COMPLETED'] },
+              date_time_filter: { closed_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
+            } },
+            limit: 500
+          };
+          if (cursor) body.cursor = cursor;
+          const data = await squareRequest(env, '/v2/orders/search', body);
+          const n = ((data && data.orders) || []).length;
+          count += n;
+          cursor = data && data.cursor;
+          out.pages.push({ page: pageNum, orders: n, hasCursor: !!cursor, errors: data && data.errors });
+          if (pageNum > 30) { out.pages.push({ note: 'stopped after 30 pages as a safety cap' }); break; }
+        } while (cursor);
+        out.count = count;
         out.ms = Date.now() - started;
       } catch (e) {
         out.ms = Date.now() - started;
         out.callError = String((e && e.message) || e);
         out.callErrorStatus = e && e.status;
-        out.callErrorStack = e && e.stack;
       }
       return json(out);
     }
