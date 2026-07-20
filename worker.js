@@ -344,50 +344,42 @@ function zonedDayStartUtc(dateStr, tz, rolloverHours) {
   if (offset2 !== offset1) instant = new Date(guess.getTime() - offset2 * 60000);
   return new Date(instant.getTime() + (rolloverHours || 0) * 3600000);
 }
-/* Counts completed orders via Orders Search (up to 500/page, so a busy month
-   stays well within Cloudflare's per-request subrequest budget). Uses the
-   Square LOCATION's own configured timezone (not the dashboard's venue-wide
-   setting, which may be a geography guess) - that is what Square's own
-   reports bucket orders by, and matching it is what makes the day boundaries
-   line up with what the owner sees in Square. Voided/cancelled orders
-   excluded via state_filter; refunds are separate records and never reduce
-   this count (kpi-spec.md). */
+/* Counts completed PAYMENTS - this is what Square's own Sales report is
+   built on and is exact by construction (no order-lifecycle guessing needed,
+   unlike Orders Search: some real sales sit in orders that never formally
+   move to Completed, e.g. card-on-file/online-checkout flows - see the
+   build's reconciliation notes). Needs the Cloudflare Workers PAID plan
+   (raises the subrequest budget from 50 to 10,000 per request) - a busy
+   month here needs ~50-60 pages at Square's fixed 100/page cap, which
+   exceeds the free plan's ceiling. Uses the Square LOCATION's own configured
+   timezone (not a geography guess) so day boundaries match what the owner
+   sees in Square. Only status COMPLETED counts; a later refund does not
+   remove a payment from this count (kpi-spec.md: refunds never reduce it). */
 async function squareCountRange(env, from, to, tz, rollover) {
   const info = await squareLocationInfo(env);
-  const locationIds = info.ids;
-  if (!locationIds.length) return 0;
+  if (!info.ids.length) return 0;
   const zone = info.timezone || tz || 'Australia/Sydney';
   const startAt = zonedDayStartUtc(from, zone, rollover || 0);
   const toNextDay = new Date(new Date(to + 'T00:00:00Z').getTime() + 86400000).toISOString().slice(0, 10);
   const endAt = zonedDayStartUtc(toNextDay, zone, rollover || 0);
-  let cursor = null, count = 0;
-  do {
-    const body = {
-      location_ids: locationIds.slice(0, 10),
-      query: {
-        filter: {
-          /* COMPLETED alone misses real sales sitting in orders that never
-             formally transitioned to Completed (common with card-on-file,
-             delivery-platform and some POS-flow payments) - see worker.js
-             build notes. OPEN is included so those aren't missed. */
-          state_filter: { states: ['COMPLETED', 'OPEN'] },
-          date_time_filter: { created_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
-        }
-      },
-      limit: 500
-    };
-    if (cursor) body.cursor = cursor;
-    const data = await squareRequest(env, '/v2/orders/search', body);
-    /* An OPEN order with a $0 total is an abandoned online checkout (cart
-       created, never paid) - not a completed sale, so it is excluded here.
-       COMPLETED orders are always real (Square would not mark a $0 cart
-       Completed). */
-    for (const o of (data && data.orders) || []) {
-      const total = (o.total_money && o.total_money.amount) || 0;
-      if (o.state === 'COMPLETED' || total > 0) count++;
-    }
-    cursor = data && data.cursor;
-  } while (cursor);
+  let count = 0;
+  for (const locationId of info.ids) {
+    let cursor = null;
+    do {
+      const p = new URLSearchParams({
+        location_id: locationId,
+        begin_time: startAt.toISOString(),
+        end_time: endAt.toISOString(),
+        sort_field: 'CREATED_AT',
+        limit: '100'
+      });
+      if (cursor) p.set('cursor', cursor);
+      const data = await squareRequest(env, '/v2/payments?' + p.toString());
+      const payments = (data && data.payments) || [];
+      count += payments.filter((pmt) => pmt.status === 'COMPLETED').length;
+      cursor = data && data.cursor;
+    } while (cursor);
+  }
   return count;
 }
 
