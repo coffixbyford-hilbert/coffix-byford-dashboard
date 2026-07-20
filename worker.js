@@ -307,13 +307,22 @@ async function squareRequest(env, path, body) {
    not it). Locking to this name keeps other venues out of the count even if
    Square's location list order changes. */
 const SQUARE_LOCATION_NAME = 'COFFIX Byford';
-async function squareLocationIds(env) {
+/* Returns { ids, timezone } for the matched location(s). Square's own
+   location record carries its own IANA timezone - that is what Square's own
+   reports bucket orders by, so we use IT rather than the venue-wide settings
+   timezone (which may be a geography guess) for day-boundary math here. */
+async function squareLocationInfo(env) {
   const data = await squareRequest(env, '/v2/locations');
   const all = (data && data.locations) || [];
-  const matched = all.filter((l) => l.name === SQUARE_LOCATION_NAME).map((l) => l.id).filter(Boolean);
-  if (matched.length) return matched;
-  /* Safety net: never silently count nothing - but this should not happen once confirmed above. */
-  return all.map((l) => l.id).filter(Boolean);
+  const matched = all.filter((l) => l.name === SQUARE_LOCATION_NAME);
+  const use = matched.length ? matched : all; /* safety net - should not happen once confirmed */
+  return {
+    ids: use.map((l) => l.id).filter(Boolean),
+    timezone: (use[0] && use[0].timezone) || null
+  };
+}
+async function squareLocationIds(env) {
+  return (await squareLocationInfo(env)).ids;
 }
 /* The UTC offset of an IANA timezone at a given instant (minutes, e.g. +660 for AEST). */
 function tzOffsetMinutes(tz, atUtcDate) {
@@ -336,18 +345,18 @@ function zonedDayStartUtc(dateStr, tz, rolloverHours) {
   return new Date(instant.getTime() + (rolloverHours || 0) * 3600000);
 }
 /* Counts completed orders via Orders Search (up to 500/page, so a busy month
-   stays well within Cloudflare's per-request subrequest budget - the earlier
-   Payments-based approach needed ~50+ pages for this venue's volume and hit
-   that ceiling). sort.sort_field MUST match the field the date filter uses
-   (CLOSED_AT) - filtering on closed_at while sorting/paginating on a
-   different field is a documented Square API gotcha that silently returns an
-   incomplete result set, which is what caused the earlier undercount.
-   Voided/cancelled orders excluded via state_filter; refunds are separate
-   records and never reduce this count (kpi-spec.md). */
+   stays well within Cloudflare's per-request subrequest budget). Uses the
+   Square LOCATION's own configured timezone (not the dashboard's venue-wide
+   setting, which may be a geography guess) - that is what Square's own
+   reports bucket orders by, and matching it is what makes the day boundaries
+   line up with what the owner sees in Square. Voided/cancelled orders
+   excluded via state_filter; refunds are separate records and never reduce
+   this count (kpi-spec.md). */
 async function squareCountRange(env, from, to, tz, rollover) {
-  const locationIds = await squareLocationIds(env);
+  const info = await squareLocationInfo(env);
+  const locationIds = info.ids;
   if (!locationIds.length) return 0;
-  const zone = tz || 'Australia/Sydney';
+  const zone = info.timezone || tz || 'Australia/Sydney';
   const startAt = zonedDayStartUtc(from, zone, rollover || 0);
   const toNextDay = new Date(new Date(to + 'T00:00:00Z').getTime() + 86400000).toISOString().slice(0, 10);
   const endAt = zonedDayStartUtc(toNextDay, zone, rollover || 0);
@@ -991,6 +1000,20 @@ export default {
     if (path === '/' || path === '/index.html') {
       if (loggedIn) return htmlResponse(dashboardHtml);
       return htmlResponse((await passcodeSet(env)) ? loginPage() : setupPage());
+    }
+    if (path === '/api/_debug_pos' && request.method === 'GET') {
+      /* TEMP diagnostic - remove once the Square count reconciles. Logged-in only. */
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const from = url.searchParams.get('from') || '2026-06-01';
+      const to = url.searchParams.get('to') || '2026-06-30';
+      const rollover = parseInt(url.searchParams.get('rollover') || '0', 10);
+      try {
+        const info = await squareLocationInfo(env);
+        const count = await squareCountRange(env, from, to, null, rollover);
+        return json({ from, to, locationInfo: info, count });
+      } catch (e) {
+        return json({ error: String((e && e.message) || e) });
+      }
     }
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
