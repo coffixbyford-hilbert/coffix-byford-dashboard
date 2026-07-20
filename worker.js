@@ -358,9 +358,8 @@ async function squareCountRange(env, from, to, tz, rollover) {
       query: {
         filter: {
           state_filter: { states: ['COMPLETED'] },
-          date_time_filter: { closed_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
-        },
-        sort: { sort_field: 'CLOSED_AT', sort_order: 'DESC' }
+          date_time_filter: { created_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
+        }
       },
       limit: 500
     };
