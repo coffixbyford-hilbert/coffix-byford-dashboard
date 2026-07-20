@@ -1020,8 +1020,8 @@ export default {
           const body = {
             location_ids: locationIds.slice(0, 10),
             query: { filter: {
-              state_filter: { states: ['COMPLETED'] },
-              date_time_filter: { closed_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
+              state_filter: { states: ['COMPLETED', 'OPEN'] },
+              date_time_filter: { created_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
             } },
             limit: 500
           };
