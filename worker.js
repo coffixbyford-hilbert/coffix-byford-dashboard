@@ -198,8 +198,12 @@ const ADAPTERS = {
       if (!env.ROSTERING_API_TOKEN) return { connected: false };
       try {
         const data = await deputyRequest(env, '/api/v1/resource/Company');
-        const name = Array.isArray(data) && data[0] && (data[0].CompanyName || data[0].Name);
-        return { connected: true, org: name || null, sandbox: false, lastSync: null };
+        const companies = Array.isArray(data) ? data : [];
+        /* Show only the venue this dashboard actually counts (see DEPUTY_COMPANY_NAME) -
+           not every company on this install, which would wrongly suggest they're all counted. */
+        const match = companies.find((c) => c.CompanyName === DEPUTY_COMPANY_NAME);
+        const name = (match && match.CompanyName) || (companies[0] && companies[0].CompanyName) || null;
+        return { connected: true, org: name, sandbox: false, lastSync: null };
       } catch (e) {
         return { connected: false };
       }
@@ -456,11 +460,24 @@ async function deputyRequest(env, path, body) {
   if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
   return res.json();
 }
-/* Sums rostered wage cost for the period from the Roster resource. Deputy
-   exposes a per-shift Cost field on most plans; if it comes back null/absent
-   this returns 0 rather than guessing - see kpi-spec.md / capability-matrix.md:
+/* This Deputy install has multiple companies (COFFIX BYFORD, COFFIX HILBERT,
+   plus a non-workplace payroll entity) - Roster/QUERY returns shifts across
+   all of them, so results are filtered to Byford's Company id, confirmed by
+   name on 2026-07-20. Resolved by name each call rather than hardcoded, in
+   case the id ever changes. */
+const DEPUTY_COMPANY_NAME = 'COFFIX BYFORD';
+async function deputyByfordCompanyId(env) {
+  const companies = await deputyRequest(env, '/api/v1/resource/Company');
+  const match = (Array.isArray(companies) ? companies : []).find((c) => c.CompanyName === DEPUTY_COMPANY_NAME);
+  return match ? match.Id : null;
+}
+/* Sums rostered wage cost for the period from the Roster resource, Byford
+   shifts only. Deputy exposes a per-shift Cost field on most plans (confirmed
+   present and populated for this account); if it comes back null/absent this
+   returns 0 rather than guessing - see kpi-spec.md / capability-matrix.md:
    the fallback here is simply not showing a misleading projected figure. */
 async function deputyRosterCost(env, from, to) {
+  const companyId = await deputyByfordCompanyId(env);
   const data = await deputyRequest(env, '/api/v1/resource/Roster/QUERY', {
     search: {
       s1: { field: 'Date', type: 'ge', data: from },
@@ -471,6 +488,8 @@ async function deputyRosterCost(env, from, to) {
   const rows = Array.isArray(data) ? data : [];
   let cost = 0;
   for (const r of rows) {
+    const rowCompanyId = r._DPMetaData && r._DPMetaData.OperationalUnitInfo && r._DPMetaData.OperationalUnitInfo.Company;
+    if (companyId != null && rowCompanyId !== companyId) continue;
     const c = Number(r.Cost);
     if (isFinite(c)) cost += c;
   }
@@ -1097,12 +1116,9 @@ export default {
       const from = url.searchParams.get('from') || '2026-07-14';
       const to = url.searchParams.get('to') || '2026-07-20';
       try {
-        const company = await deputyRequest(env, '/api/v1/resource/Company');
-        const roster = await deputyRequest(env, '/api/v1/resource/Roster/QUERY', {
-          search: { s1: { field: 'Date', type: 'ge', data: from }, s2: { field: 'Date', type: 'le', data: to } },
-          max: 20
-        });
-        return json({ from, to, company, rosterSample: roster });
+        const companyId = await deputyByfordCompanyId(env);
+        const cost = await deputyRosterCost(env, from, to);
+        return json({ from, to, byfordCompanyId: companyId, cost });
       } catch (e) {
         return json({ error: String((e && e.message) || e), status: e && e.status });
       }
