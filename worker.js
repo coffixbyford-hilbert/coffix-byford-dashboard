@@ -1110,19 +1110,6 @@ export default {
       if (loggedIn) return htmlResponse(dashboardHtml);
       return htmlResponse((await passcodeSet(env)) ? loginPage() : setupPage());
     }
-    if (path === '/api/_debug_deputy' && request.method === 'GET') {
-      /* TEMP diagnostic - remove once Deputy's roster cost data is confirmed. Logged-in only. */
-      if (!loggedIn) return json({ error: 'auth' }, 401);
-      const from = url.searchParams.get('from') || '2026-07-14';
-      const to = url.searchParams.get('to') || '2026-07-20';
-      try {
-        const companyId = await deputyByfordCompanyId(env);
-        const cost = await deputyRosterCost(env, from, to);
-        return json({ from, to, byfordCompanyId: companyId, cost });
-      } catch (e) {
-        return json({ error: String((e && e.message) || e), status: e && e.status });
-      }
-    }
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
