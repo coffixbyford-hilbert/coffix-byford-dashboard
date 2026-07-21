@@ -926,6 +926,12 @@ function metricCard(key, cur, prev, yoy, r) {
   } else {
     card.appendChild(headline(key, cur, v));
     if (key === 'acs' && v === 'dash') card.appendChild(el('div', 'm-sub', 'No transactions in this period'));
+    if (key === 'transactions' || key === 'acs') {
+      var spanDays = Math.round((new Date(r.to + 'T00:00:00Z') - new Date(r.from + 'T00:00:00Z')) / 86400000) + 1;
+      if (spanDays > 10) {
+        card.appendChild(el('div', 'm-sub', 'Runs a few % high over a full month or longer (a Square reporting limitation) — daily and weekly views are exact.'));
+      }
+    }
     if (key === 'wage' && P.rostering && cur.rosteredCost != null && cur.revenue != null && cur.revenue !== 0) {
       var pj = ((cur.rosteredCost / cur.revenue) * 100).toFixed(1);
       var ps = el('div', 'm-sub');
@@ -1318,9 +1324,12 @@ function renderRecon(root) {
     head.appendChild(el('span', 'recon-fig', fmtValue(k, metricValue(k, cur))));
     card.appendChild(head);
 
+    var spanDaysR = Math.round((new Date(r.to + 'T00:00:00Z') - new Date(r.from + 'T00:00:00Z')) / 86400000) + 1;
     var inst;
     if (k === 'transactions') {
-      inst = 'Open ' + P.pos + ' reporting for exactly these dates. Does the number of completed transactions match the figure above?';
+      inst = spanDaysR > 10
+        ? 'Open ' + P.pos + ' reporting for exactly these dates. For a period this long, expect this figure to run a few % higher than ' + P.pos + '’s own total (a known reporting limitation) — close is expected here, not exact. For an exact check, pick a single day or a week instead.'
+        : 'Open ' + P.pos + ' reporting for exactly these dates. Does the number of completed transactions match the figure above?';
     } else if (k === 'acs') {
       inst = 'This one is worked out from two numbers you’ve already checked: revenue (from ' + P.accounting + ') divided by transactions (from ' + P.pos + '). If both inputs match, this is right by definition.';
     } else if (k === 'wage') {
