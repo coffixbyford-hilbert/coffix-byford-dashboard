@@ -1110,6 +1110,27 @@ export default {
       if (loggedIn) return htmlResponse(dashboardHtml);
       return htmlResponse((await passcodeSet(env)) ? loginPage() : setupPage());
     }
+    if (path === '/api/_debug_xero_orgs' && request.method === 'GET') {
+      /* TEMP diagnostic - remove once the Byford-vs-Hilbert question is settled. Logged-in only. */
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      try {
+        const h = makeHelpers(env, 'accounting');
+        const conns = await h.fetchJson('https://api.xero.com/connections', { headers: { Accept: 'application/json' } });
+        const conn = await xeroConnection(env, h);
+        const org = await h.fetchJson('https://api.xero.com/api.xro/2.0/Organisation', {
+          headers: { Accept: 'application/json', 'Xero-Tenant-Id': conn.tenantId }
+        });
+        let tracking = null;
+        try {
+          tracking = await h.fetchJson('https://api.xero.com/api.xro/2.0/TrackingCategories', {
+            headers: { Accept: 'application/json', 'Xero-Tenant-Id': conn.tenantId }
+          });
+        } catch (e) { tracking = { error: String((e && e.message) || e) }; }
+        return json({ allXeroConnections: conns, connectedTenant: conn, organisation: org, trackingCategories: tracking });
+      } catch (e) {
+        return json({ error: String((e && e.message) || e) });
+      }
+    }
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
