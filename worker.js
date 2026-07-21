@@ -191,12 +191,38 @@ const ADAPTERS = {
      Example (Deputy): pasted permanent token (secret ROSTERING_API_TOKEN).
   */
   rostering: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('rostering'); },
-    async fetchMonthly(env, h, q) { return { months: [], cost: [] }; }
+    async status(env, h) {
+      if (!env.ROSTERING_API_TOKEN) return { connected: false };
+      try {
+        const data = await deputyRequest(env, '/api/v1/resource/Company');
+        const name = Array.isArray(data) && data[0] && (data[0].CompanyName || data[0].Name);
+        return { connected: true, org: name || null, sandbox: false, lastSync: null };
+      } catch (e) {
+        return { connected: false };
+      }
+    },
+    async fetchRange(env, h, q) {
+      return { cost: await deputyRosterCost(env, q.from, q.to) };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const cost = [];
+      for (const mo of months) {
+        const [y, m] = mo.split('-').map(Number);
+        const from = mo + '-01';
+        const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+        const to = mo + '-' + String(lastDay).padStart(2, '0');
+        try {
+          cost.push(await deputyRosterCost(env, from, to));
+        } catch (e) {
+          cost.push(null);
+        }
+      }
+      return { months, cost };
+    }
   }
 };
 
@@ -411,6 +437,44 @@ async function squareCountRange(env, from, to, tz, rollover) {
     for (const ids of results) for (const id of ids) seen.add(id);
   }
   return seen.size;
+}
+
+/* ----------------------------------------------------------------------------
+   Deputy rostering helpers. Powers the OPTIONAL projected Wage % only - the
+   actual Wage % (from Xero) already covers the board, so this never blocks
+   the build if Deputy's cost data doesn't pan out (fallback ladder).
+---------------------------------------------------------------------------- */
+const DEPUTY_INSTALL_HOST = 'a4b00114045513.au.deputy.com';
+async function deputyRequest(env, path, body) {
+  const token = env.ROSTERING_API_TOKEN;
+  if (!token) { const e = new Error('Deputy not connected'); e.status = 401; throw e; }
+  const res = await fetch('https://' + DEPUTY_INSTALL_HOST + path, {
+    method: body ? 'POST' : 'GET',
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+  return res.json();
+}
+/* Sums rostered wage cost for the period from the Roster resource. Deputy
+   exposes a per-shift Cost field on most plans; if it comes back null/absent
+   this returns 0 rather than guessing - see kpi-spec.md / capability-matrix.md:
+   the fallback here is simply not showing a misleading projected figure. */
+async function deputyRosterCost(env, from, to) {
+  const data = await deputyRequest(env, '/api/v1/resource/Roster/QUERY', {
+    search: {
+      s1: { field: 'Date', type: 'ge', data: from },
+      s2: { field: 'Date', type: 'le', data: to }
+    },
+    max: 2000
+  });
+  const rows = Array.isArray(data) ? data : [];
+  let cost = 0;
+  for (const r of rows) {
+    const c = Number(r.Cost);
+    if (isFinite(c)) cost += c;
+  }
+  return cost;
 }
 
 /* ============================================================================
@@ -1026,6 +1090,22 @@ export default {
     if (path === '/' || path === '/index.html') {
       if (loggedIn) return htmlResponse(dashboardHtml);
       return htmlResponse((await passcodeSet(env)) ? loginPage() : setupPage());
+    }
+    if (path === '/api/_debug_deputy' && request.method === 'GET') {
+      /* TEMP diagnostic - remove once Deputy's roster cost data is confirmed. Logged-in only. */
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const from = url.searchParams.get('from') || '2026-07-14';
+      const to = url.searchParams.get('to') || '2026-07-20';
+      try {
+        const company = await deputyRequest(env, '/api/v1/resource/Company');
+        const roster = await deputyRequest(env, '/api/v1/resource/Roster/QUERY', {
+          search: { s1: { field: 'Date', type: 'ge', data: from }, s2: { field: 'Date', type: 'le', data: to } },
+          max: 20
+        });
+        return json({ from, to, company, rosterSample: roster });
+      } catch (e) {
+        return json({ error: String((e && e.message) || e), status: e && e.status });
+      }
     }
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
