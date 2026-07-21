@@ -927,7 +927,7 @@ function metricCard(key, cur, prev, yoy, r) {
     card.appendChild(headline(key, cur, v));
     if (key === 'acs' && v === 'dash') card.appendChild(el('div', 'm-sub', 'No transactions in this period'));
     if (key === 'transactions' || key === 'acs') {
-      var spanDays = Math.round((new Date(r.to + 'T00:00:00Z') - new Date(r.from + 'T00:00:00Z')) / 86400000) + 1;
+      var spanDays = Math.round((r.to.getTime() - r.from.getTime()) / 86400000) + 1;
       if (spanDays > 10) {
         card.appendChild(el('div', 'm-sub', 'Runs a few % high over a full month or longer (a Square reporting limitation) — daily and weekly views are exact.'));
       }
@@ -1324,7 +1324,7 @@ function renderRecon(root) {
     head.appendChild(el('span', 'recon-fig', fmtValue(k, metricValue(k, cur))));
     card.appendChild(head);
 
-    var spanDaysR = Math.round((new Date(r.to + 'T00:00:00Z') - new Date(r.from + 'T00:00:00Z')) / 86400000) + 1;
+    var spanDaysR = Math.round((r.to.getTime() - r.from.getTime()) / 86400000) + 1;
     var inst;
     if (k === 'transactions') {
       inst = spanDaysR > 10
