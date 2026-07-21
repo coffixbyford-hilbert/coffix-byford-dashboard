@@ -1029,29 +1029,31 @@ export default {
         out.ordersCompletedCreatedAt = await ordersCount(['COMPLETED'], 'created_at');
         out.ordersCompletedOpenCreatedAt = await ordersCount(['COMPLETED', 'OPEN'], 'created_at');
 
-        /* Method B: Payments, COMPLETED status, de-duped by id, with per-page detail */
-        let pCursor = null, pAll = 0, pageNum = 0;
+        /* Method B: Payments, COMPLETED status, de-duped by id, broken down by source_type/product */
+        let pCursor = null, pAll = 0;
         const seen = new Set();
-        const dupesFound = [];
-        out.pagesB = [];
+        const bySourceType = {};
+        const bySquareProduct = {};
         do {
-          pageNum++;
           const p = new URLSearchParams({ location_id: info.ids[0], begin_time: startAt.toISOString(), end_time: endAt.toISOString(), sort_field: 'CREATED_AT', limit: '100' });
           if (pCursor) p.set('cursor', pCursor);
           const data = await squareRequest(env, '/v2/payments?' + p.toString());
           const payments = (data && data.payments) || [];
           pAll += payments.length;
-          let newOnPage = 0, dupOnPage = 0;
           for (const pmt of payments) {
             if (pmt.status !== 'COMPLETED') continue;
-            if (seen.has(pmt.id)) { dupOnPage++; dupesFound.push(pmt.id); } else { seen.add(pmt.id); newOnPage++; }
+            if (seen.has(pmt.id)) continue;
+            seen.add(pmt.id);
+            const st = pmt.source_type || 'UNKNOWN';
+            bySourceType[st] = (bySourceType[st] || 0) + 1;
+            const sp = (pmt.application_details && pmt.application_details.square_product) || 'UNKNOWN';
+            bySquareProduct[sp] = (bySquareProduct[sp] || 0) + 1;
           }
-          out.pagesB.push({ page: pageNum, total: payments.length, newCompleted: newOnPage, dupCompleted: dupOnPage, firstCreatedAt: payments[0] && payments[0].created_at, lastCreatedAt: payments[payments.length - 1] && payments[payments.length - 1].created_at, hasCursor: !!(data && data.cursor) });
           pCursor = data && data.cursor;
-          if (pageNum > 70) { out.pagesB.push({ note: 'stopped after 70 pages' }); break; }
         } while (pCursor);
         out.paymentsCompleted = seen.size;
-        out.dupesFound = dupesFound;
+        out.bySourceType = bySourceType;
+        out.bySquareProduct = bySquareProduct;
         out.paymentsAllStatuses = pAll;
 
         return json(out);
