@@ -330,13 +330,14 @@ async function squareRequest(env, path, body) {
   return res.json();
 }
 /* This Square account has multiple locations (Byford, Hilbert, Little Bao Co).
-   This dashboard is built for the Byford venue only (confirmed against the
-   connected Xero org "Coffix Byford") - the owner confirmed on 2026-07-19
-   that the location named exactly "COFFIX Byford" is the correct, currently
-   trading one (a second, differently-capitalised "Coffix Byford" entry is
-   not it). Locking to this name keeps other venues out of the count even if
-   Square's location list order changes. */
-const SQUARE_LOCATION_NAME = 'COFFIX Byford';
+   This dashboard is built for the Hilbert venue only (confirmed against the
+   connected Xero org "Coffix Hilbert"). The exact Square location name below
+   is a starting guess matching the Byford naming pattern - CONFIRM the exact
+   name (and capitalisation - Byford had two similarly-named entries, only
+   one of which was correct) with the owner during the Square connection step
+   before trusting the count. Locking to this name keeps other venues out of
+   the count even if Square's location list order changes. */
+const SQUARE_LOCATION_NAME = 'COFFIX Hilbert';
 /* Returns { ids, timezone } for the matched location(s). Square's own
    location record carries its own IANA timezone - that is what Square's own
    reports bucket orders by, so we use IT rather than the venue-wide settings
@@ -462,22 +463,24 @@ async function deputyRequest(env, path, body) {
 }
 /* This Deputy install has multiple companies (COFFIX BYFORD, COFFIX HILBERT,
    plus a non-workplace payroll entity) - Roster/QUERY returns shifts across
-   all of them, so results are filtered to Byford's Company id, confirmed by
-   name on 2026-07-20. Resolved by name each call rather than hardcoded, in
-   case the id ever changes. */
-const DEPUTY_COMPANY_NAME = 'COFFIX BYFORD';
-async function deputyByfordCompanyId(env) {
+   all of them, so results are filtered to Hilbert's Company id. Resolved by
+   name each call rather than hardcoded, in case the id ever changes. NOT YET
+   confirmed with the owner (was confirmed for Byford on 2026-07-20, not
+   Hilbert) - reconfirm the exact company name during the Deputy step. */
+const DEPUTY_COMPANY_NAME = 'COFFIX HILBERT';
+async function deputyHilbertCompanyId(env) {
   const companies = await deputyRequest(env, '/api/v1/resource/Company');
   const match = (Array.isArray(companies) ? companies : []).find((c) => c.CompanyName === DEPUTY_COMPANY_NAME);
   return match ? match.Id : null;
 }
-/* Sums rostered wage cost for the period from the Roster resource, Byford
+/* Sums rostered wage cost for the period from the Roster resource, Hilbert
    shifts only. Deputy exposes a per-shift Cost field on most plans (confirmed
-   present and populated for this account); if it comes back null/absent this
-   returns 0 rather than guessing - see kpi-spec.md / capability-matrix.md:
-   the fallback here is simply not showing a misleading projected figure. */
+   present and populated for the Byford company on this account; not yet
+   re-confirmed for Hilbert); if it comes back null/absent this returns 0
+   rather than guessing - see kpi-spec.md / capability-matrix.md: the
+   fallback here is simply not showing a misleading projected figure. */
 async function deputyRosterCost(env, from, to) {
-  const companyId = await deputyByfordCompanyId(env);
+  const companyId = await deputyHilbertCompanyId(env);
   const data = await deputyRequest(env, '/api/v1/resource/Roster/QUERY', {
     search: {
       s1: { field: 'Date', type: 'ge', data: from },
@@ -740,7 +743,7 @@ function apiLogout() {
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Set-Cookie': 'vd_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0' } });
 }
 function loginPage() {
-  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign in</title>'
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign in – Coffix Byford Dashboard</title>'
     + '<link href="https://fonts.googleapis.com/css2?family=Khand:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">'
     + '<style>'
     + 'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#FAF7F2;font-family:"DM Sans",sans-serif;color:#2A2420}'
@@ -765,7 +768,7 @@ function loginPage() {
 }
 
 function setupPage() {
-  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Set your password</title>'
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Set your password – Coffix Byford Dashboard</title>'
     + '<link href="https://fonts.googleapis.com/css2?family=Khand:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">'
     + '<style>'
     + 'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#FAF7F2;font-family:"DM Sans",sans-serif;color:#2A2420}'
