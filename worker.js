@@ -344,17 +344,16 @@ function zonedDayStartUtc(dateStr, tz, rolloverHours) {
   if (offset2 !== offset1) instant = new Date(guess.getTime() - offset2 * 60000);
   return new Date(instant.getTime() + (rolloverHours || 0) * 3600000);
 }
-/* Counts CLOSED orders (state COMPLETED, filtered by closed_at) - this
-   matches the owner's own Square Sales Summary report exactly, which groups
-   by "Orders - Closed orders" (confirmed directly from their Square Reports
-   settings on 2026-07-20, along with the Reporting day cutoff: Default,
-   midnight-midnight, Perth). Orders Search pages at up to 500/request, so
-   this comfortably fits the Cloudflare Workers FREE plan's subrequest budget
-   - no paid plan needed for this metric. Uses the Square LOCATION's own
-   configured timezone (not a geography guess) so day boundaries match what
-   the owner sees in Square. Voided/cancelled orders are excluded via
-   state_filter; refunds are separate records and never reduce this count
-   (kpi-spec.md). */
+/* Counts completed PAYMENTS - verified against the owner's own Square Sales
+   Summary report on a clean single day (20 Jul 2026: dashboard and Square
+   both said 177, exact) - this is the correct method. Needs the Cloudflare
+   Workers PAID plan for a full month's pagination (Square caps ListPayments
+   at 100/page; a busy month needs ~50-60 pages, over the free plan's
+   50-subrequest ceiling). De-duplicates by payment id as a safeguard against
+   any cursor/page overlap. Uses the Square LOCATION's own configured
+   timezone (not a geography guess) so day boundaries match what the owner
+   sees in Square. Only status COMPLETED counts; a later refund does not
+   remove a payment from this count (kpi-spec.md: refunds never reduce it). */
 async function squareCountRange(env, from, to, tz, rollover) {
   const info = await squareLocationInfo(env);
   if (!info.ids.length) return 0;
@@ -362,24 +361,26 @@ async function squareCountRange(env, from, to, tz, rollover) {
   const startAt = zonedDayStartUtc(from, zone, rollover || 0);
   const toNextDay = new Date(new Date(to + 'T00:00:00Z').getTime() + 86400000).toISOString().slice(0, 10);
   const endAt = zonedDayStartUtc(toNextDay, zone, rollover || 0);
-  let cursor = null, count = 0;
-  do {
-    const body = {
-      location_ids: info.ids.slice(0, 10),
-      query: {
-        filter: {
-          state_filter: { states: ['COMPLETED'] },
-          date_time_filter: { closed_at: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
-        }
-      },
-      limit: 500
-    };
-    if (cursor) body.cursor = cursor;
-    const data = await squareRequest(env, '/v2/orders/search', body);
-    count += ((data && data.orders) || []).length;
-    cursor = data && data.cursor;
-  } while (cursor);
-  return count;
+  const seen = new Set();
+  for (const locationId of info.ids) {
+    let cursor = null;
+    do {
+      const p = new URLSearchParams({
+        location_id: locationId,
+        begin_time: startAt.toISOString(),
+        end_time: endAt.toISOString(),
+        sort_field: 'CREATED_AT',
+        limit: '100'
+      });
+      if (cursor) p.set('cursor', cursor);
+      const data = await squareRequest(env, '/v2/payments?' + p.toString());
+      for (const pmt of (data && data.payments) || []) {
+        if (pmt.status === 'COMPLETED') seen.add(pmt.id);
+      }
+      cursor = data && data.cursor;
+    } while (cursor);
+  }
+  return seen.size;
 }
 
 /* ============================================================================
@@ -1028,18 +1029,29 @@ export default {
         out.ordersCompletedCreatedAt = await ordersCount(['COMPLETED'], 'created_at');
         out.ordersCompletedOpenCreatedAt = await ordersCount(['COMPLETED', 'OPEN'], 'created_at');
 
-        /* Method B: Payments, COMPLETED status */
-        let pCursor = null, pCount = 0, pAll = 0;
+        /* Method B: Payments, COMPLETED status, de-duped by id, with per-page detail */
+        let pCursor = null, pAll = 0, pageNum = 0;
+        const seen = new Set();
+        const dupesFound = [];
+        out.pagesB = [];
         do {
+          pageNum++;
           const p = new URLSearchParams({ location_id: info.ids[0], begin_time: startAt.toISOString(), end_time: endAt.toISOString(), sort_field: 'CREATED_AT', limit: '100' });
           if (pCursor) p.set('cursor', pCursor);
           const data = await squareRequest(env, '/v2/payments?' + p.toString());
           const payments = (data && data.payments) || [];
           pAll += payments.length;
-          pCount += payments.filter((pmt) => pmt.status === 'COMPLETED').length;
+          let newOnPage = 0, dupOnPage = 0;
+          for (const pmt of payments) {
+            if (pmt.status !== 'COMPLETED') continue;
+            if (seen.has(pmt.id)) { dupOnPage++; dupesFound.push(pmt.id); } else { seen.add(pmt.id); newOnPage++; }
+          }
+          out.pagesB.push({ page: pageNum, total: payments.length, newCompleted: newOnPage, dupCompleted: dupOnPage, firstCreatedAt: payments[0] && payments[0].created_at, lastCreatedAt: payments[payments.length - 1] && payments[payments.length - 1].created_at, hasCursor: !!(data && data.cursor) });
           pCursor = data && data.cursor;
+          if (pageNum > 70) { out.pagesB.push({ note: 'stopped after 70 pages' }); break; }
         } while (pCursor);
-        out.paymentsCompleted = pCount;
+        out.paymentsCompleted = seen.size;
+        out.dupesFound = dupesFound;
         out.paymentsAllStatuses = pAll;
 
         return json(out);
