@@ -996,6 +996,57 @@ export default {
       if (loggedIn) return htmlResponse(dashboardHtml);
       return htmlResponse((await passcodeSet(env)) ? loginPage() : setupPage());
     }
+    if (path === '/api/_debug_pos' && request.method === 'GET') {
+      /* TEMP diagnostic - remove once the Square count reconciles. Logged-in only. */
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const from = url.searchParams.get('from');
+      const to = url.searchParams.get('to');
+      try {
+        const info = await squareLocationInfo(env);
+        const zone = info.timezone || 'Australia/Sydney';
+        const startAt = zonedDayStartUtc(from, zone, 0);
+        const toNextDay = new Date(new Date(to + 'T00:00:00Z').getTime() + 86400000).toISOString().slice(0, 10);
+        const endAt = zonedDayStartUtc(toNextDay, zone, 0);
+        const out = { from, to, timezone: zone, startAt: startAt.toISOString(), endAt: endAt.toISOString() };
+
+        /* Method A: Orders, COMPLETED only, closed_at */
+        async function ordersCount(states, dateField) {
+          let cursor = null, n = 0;
+          do {
+            const body = { location_ids: info.ids.slice(0, 10), query: { filter: {
+              state_filter: { states },
+              date_time_filter: { [dateField]: { start_at: startAt.toISOString(), end_at: endAt.toISOString() } }
+            } }, limit: 500 };
+            if (cursor) body.cursor = cursor;
+            const data = await squareRequest(env, '/v2/orders/search', body);
+            n += ((data && data.orders) || []).length;
+            cursor = data && data.cursor;
+          } while (cursor);
+          return n;
+        }
+        out.ordersCompletedClosedAt = await ordersCount(['COMPLETED'], 'closed_at');
+        out.ordersCompletedCreatedAt = await ordersCount(['COMPLETED'], 'created_at');
+        out.ordersCompletedOpenCreatedAt = await ordersCount(['COMPLETED', 'OPEN'], 'created_at');
+
+        /* Method B: Payments, COMPLETED status */
+        let pCursor = null, pCount = 0, pAll = 0;
+        do {
+          const p = new URLSearchParams({ location_id: info.ids[0], begin_time: startAt.toISOString(), end_time: endAt.toISOString(), sort_field: 'CREATED_AT', limit: '100' });
+          if (pCursor) p.set('cursor', pCursor);
+          const data = await squareRequest(env, '/v2/payments?' + p.toString());
+          const payments = (data && data.payments) || [];
+          pAll += payments.length;
+          pCount += payments.filter((pmt) => pmt.status === 'COMPLETED').length;
+          pCursor = data && data.cursor;
+        } while (pCursor);
+        out.paymentsCompleted = pCount;
+        out.paymentsAllStatuses = pAll;
+
+        return json(out);
+      } catch (e) {
+        return json({ error: String((e && e.message) || e), stack: e && e.stack });
+      }
+    }
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
