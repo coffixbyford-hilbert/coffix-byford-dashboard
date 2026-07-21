@@ -1110,6 +1110,30 @@ export default {
       if (loggedIn) return htmlResponse(dashboardHtml);
       return htmlResponse((await passcodeSet(env)) ? loginPage() : setupPage());
     }
+    if (path === '/api/_debug_wages' && request.method === 'GET') {
+      /* TEMP diagnostic - remove once the wage-account mapping is confirmed. Logged-in only. */
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const from = url.searchParams.get('from') || '2026-06-01';
+      const to = url.searchParams.get('to') || '2026-06-30';
+      try {
+        const h = makeHelpers(env, 'accounting');
+        const conn = await xeroConnection(env, h);
+        const p = new URLSearchParams({ fromDate: from, toDate: to });
+        const raw = await h.fetchJson('https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?' + p.toString(), {
+          headers: { Accept: 'application/json', 'Xero-Tenant-Id': conn.tenantId }
+        });
+        const rows = (raw && raw.Reports && raw.Reports[0] && raw.Reports[0].Rows) || [];
+        const opex = xeroFindSection(rows, (t) => /operating expenses|expenses/i.test(t) && !/cost of sales/i.test(t));
+        const lines = opex ? xeroFlattenRows(opex.Rows).map((r) => ({
+          label: (r.Cells && r.Cells[0] && r.Cells[0].Value) || '',
+          amount: xeroLastCellNum(r),
+          matchedAsWage: XERO_WAGE_KEYWORDS.test((r.Cells && r.Cells[0] && r.Cells[0].Value) || '')
+        })) : [];
+        return json({ from, to, opexSectionTitle: opex && opex.Title, lines, parsed: xeroParsePnL(raw) });
+      } catch (e) {
+        return json({ error: String((e && e.message) || e) });
+      }
+    }
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
